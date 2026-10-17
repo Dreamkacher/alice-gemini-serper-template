@@ -54,7 +54,11 @@ function safeHistory(history) {
   return history
     .filter(item => item && (item.role === "user" || item.role === "model") && typeof item.text === "string")
     .slice(-MAX_HISTORY_MESSAGES)
-    .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
+    .map(item => ({ 
+      // OpenAI ждет роль 'assistant' вместо 'model'
+      role: item.role === "model" ? "assistant" : "user", 
+      text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) 
+    }));
 }
 
 async function fetchJson(url, options, timeoutMs) {
@@ -118,31 +122,35 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
   if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
 
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
+  // Формируем массив сообщений в формате OpenAI (поддерживается apinet.cloud/v1)
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...safeHistory(history).map(item => ({
+      role: item.role,
+      content: item.text
+    }))
+  ];
 
-  const prompt = searchContext
+  const userPrompt = searchContext
     ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
     : text;
-  contents.push({ role: "user", parts: [{ text: prompt }] });
+  
+  messages.push({ role: "user", content: userPrompt });
 
+  // Делаем запрос на OpenAI-совместимый шлюз apinet.cloud/v1
   const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    "https://apinet.cloud/v1/chat/completions",
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-goog-api-key": key
+        "Authorization": `Bearer ${key}`
       },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
-        }
+        model: model,
+        messages: messages,
+        temperature: 0.5,
+        max_tokens: 240
       })
     },
     Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
@@ -150,24 +158,20 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
+    console.error("API Gateway request failed with HTTP", status, data);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     throw new Error("GEMINI_REQUEST_FAILED");
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
+  const choice = data?.choices?.[0];
+  const answer = String(choice?.message?.content || "").trim();
 
   if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
     throw new Error("GEMINI_EMPTY_RESPONSE");
   }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
+  if (choice?.finish_reason === "length") {
+    console.warn("Model reached the output token limit.");
   }
   return answer;
 }
@@ -177,9 +181,9 @@ function errorForUser(error) {
     case "MISSING_GEMINI_KEY":
       return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
     case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
+      return "Не удалось подключиться к шлюзу. Проверьте API-ключ в настройках Vercel.";
     case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
+      return "Сейчас превышен лимит запросов. Попробуйте немного позже.";
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
@@ -221,7 +225,6 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
@@ -235,7 +238,7 @@ export default async function handler(req, res) {
     const history = [
       ...oldHistory,
       { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
-      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
+      { role: "assistant", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
     return res.status(200).json(aliceResponse(answer, false, history));
